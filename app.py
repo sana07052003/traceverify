@@ -1,0 +1,288 @@
+"""TraceVerify - Streamlit app: explainable multimodal misinformation verification (MOCHEG)."""
+from __future__ import annotations
+
+import os
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import streamlit as st
+
+from traceverify import config
+from traceverify.artifacts import ensure_artifacts, load_reports
+from traceverify.classical import NAMES
+
+st.set_page_config(page_title="TraceVerify", page_icon="🔎", layout="wide")
+st.markdown("""
+<style>
+.block-container {padding-top: 2rem; max-width: 1250px;}
+.verdict {border-radius: 14px; padding: 18px 22px; margin: 6px 0 12px 0; border: 1px solid rgba(128,128,128,.25);}
+.verdict h2 {margin: 0; font-size: 1.9rem;}
+.verdict small {opacity: .75;}
+.pill {display:inline-block; padding:2px 10px; border-radius:999px; font-size:.78rem; background:rgba(128,128,128,.18);}
+</style>""", unsafe_allow_html=True)
+
+COLORS = {"supported": "#2E7D5B", "refuted": "#B5483A", "nei": "#B08D3E"}
+EXAMPLES = {
+    "Celebrity hoax": "Actor Scott Baio died in a small plane crash on his way to play golf with President Trump.",
+    "Viral photo": "Photographs show baby copperhead snakes discovered in a potted plant.",
+    "Political": "The Trump administration fired the U.S. pandemic response team in 2018 to cut costs.",
+}
+
+
+# ----------------------------------------------------------------------------- helpers
+def resolve_api_key(user_value: str) -> str:
+    if user_value:
+        return user_value
+    try:
+        if "GROQ_API_KEY" in st.secrets:
+            return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        pass
+    return os.getenv("GROQ_API_KEY", "")
+
+
+@st.cache_resource(show_spinner="Loading models and evidence index (first run only)...")
+def load_system():
+    ensure_artifacts()
+    from traceverify.pipeline import TraceVerify
+    return TraceVerify()
+
+
+def signed_bars(pairs, title: str, pos_note: str):
+    if not pairs:
+        st.info("No attributable terms found for this input.")
+        return
+    pairs = pairs[::-1]
+    fig, ax = plt.subplots(figsize=(5.2, 0.4 * len(pairs) + 0.9))
+    ax.barh([p[0] for p in pairs], [p[1] for p in pairs],
+            color=["#2E7D5B" if p[1] >= 0 else "#B5483A" for p in pairs])
+    ax.axvline(0, color="#888", lw=0.8)
+    ax.set_title(title, fontsize=10, loc="left")
+    ax.set_xlabel(pos_note, fontsize=8)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def confusion_fig(m: dict):
+    import numpy as np
+    cm = np.array(m["confusion_matrix"])
+    fig, ax = plt.subplots(figsize=(4.2, 3.4))
+    ax.imshow(cm, cmap="Blues")
+    labels = [config.DISPLAY[l] for l in m["labels"]]
+    ax.set_xticks(range(len(labels)), labels, rotation=25, ha="right", fontsize=8)
+    ax.set_yticks(range(len(labels)), labels, fontsize=8)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, int(cm[i, j]), ha="center", va="center",
+                    color="white" if cm[i, j] > cm.max() / 2 else "black", fontsize=9)
+    ax.set_xlabel("Predicted", fontsize=8)
+    ax.set_ylabel("True", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def verdict_card(v: dict):
+    c = COLORS[v["label"]]
+    st.markdown(
+        f"<div class='verdict' style='background:{c}18;border-left:6px solid {c}'>"
+        f"<small>VERDICT</small><h2 style='color:{c}'>{config.DISPLAY[v['label']]}</h2>"
+        f"<small>confidence {v['confidence']:.0%} &nbsp;·&nbsp; decided by "
+        f"<b>{NAMES.get(v['decided_by'], v['decided_by'])}</b></small></div>", unsafe_allow_html=True)
+    st.progress(min(max(v["confidence"], 0.0), 1.0))
+
+
+def render_related(res: dict):
+    st.subheader("Related fact-checked claims (from the image)")
+    related = res.get("related_claims") or []
+    if not related:
+        st.info("Image index not available. Run scripts/extract_clip_features.py.")
+    for n, r in enumerate(related):
+        c = COLORS.get(r["label"], "#888")
+        with st.expander(f"{r['claim'][:110]}  ·  {config.DISPLAY.get(r['label'], r['label'])}  ·  sim {r['score']:.2f}"):
+            st.markdown(f"<span class='pill' style='color:{c}'>{config.DISPLAY.get(r['label'], r['label'])}</span>",
+                        unsafe_allow_html=True)
+            for e in r.get("evidence", []):
+                st.write("• " + e)
+            if r.get("source_url"):
+                st.link_button("Source fact-check", r["source_url"], key=f"rel{n}")
+    st.caption("Image-to-text similarity in CLIP is a coarse signal: use it as a lead, not as proof.")
+
+
+def render_result(res: dict):
+    for w in res.get("warnings", []):
+        st.warning(w)
+    if res.get("verdict") is None:
+        render_related(res)
+        return
+    verdict_card(res["verdict"])
+    left, right = st.columns([1.15, 1])
+    with left:
+        st.subheader("Why (evidence-grounded)")
+        exp = res["explanation"]
+        st.write(exp["text"])
+        st.caption("Generated by an LLM restricted to the retrieved passages." if exp["source"] == "llm"
+                   else "Template explanation (no LLM call).")
+        st.subheader("Retrieved evidence")
+        for i, e in enumerate(res["evidence"], 1):
+            with st.expander(f"[{i}] similarity {e['score']:.2f} — {e['text'][:90]}..."):
+                st.write(e["text"])
+                if e.get("source_url"):
+                    st.link_button("Source fact-check", e["source_url"], key=f"src{i}")
+        if res["mode"] == "text+image":
+            render_related(res)
+    with right:
+        st.subheader("Model votes")
+        rows = [{"Model": m["name"], "Prediction": config.DISPLAY[m["label"]], "Confidence": f"{m['confidence']:.0%}"}
+                for m in res["members"]]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if res.get("ensemble_weights"):
+            w = pd.Series({NAMES[k]: v for k, v in res["ensemble_weights"].items()}, name="trust weight")
+            st.caption("How much the stacking meta-learner trusts each model")
+            st.bar_chart(w)
+        if "clip_similarity" in res:
+            st.metric("Image ↔ claim CLIP similarity", f"{res['clip_similarity']:.2f}", res["clip_band"],
+                      delta_color="off")
+        xai = res.get("xai", {})
+        label_txt = config.DISPLAY[res["verdict"]["label"]]
+        if xai.get("shap_terms"):
+            signed_bars(xai["shap_terms"], "SHAP · Logistic Regression", f"→ pushes toward '{label_txt}' (+) / away (−)")
+        if xai.get("occlusion_terms"):
+            signed_bars(xai["occlusion_terms"], "Occlusion · deep network",
+                        f"probability drop when word removed (+ supports '{label_txt}')")
+        if xai.get("modality_ablation"):
+            st.caption(f"Deep network P('{label_txt}') under input ablation")
+            st.bar_chart(pd.Series(xai["modality_ablation"], name="probability"))
+
+
+# ----------------------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.title("🔎 TraceVerify")
+    st.caption("Explainable, evidence-grounded verification for text and images.")
+    top_k = st.slider("Evidence passages", 3, 10, 5)
+    use_llm = st.toggle("LLM explanation (Groq)", value=True)
+    typed_key = st.text_input("Groq API key (optional)", type="password",
+                              help="Used only for this session. Prefer st.secrets / env var GROQ_API_KEY.")
+    api_key = resolve_api_key(typed_key)
+    st.caption("🔑 key found" if api_key else "No key → template explanation")
+
+try:
+    system = load_system()
+except FileNotFoundError as exc:
+    st.title("TraceVerify")
+    st.error(str(exc))
+    st.stop()
+
+reports = load_reports()
+tab_verify, tab_perf, tab_xai, tab_about = st.tabs(["Verify", "Models & performance", "Explainability", "About"])
+
+# ----------------------------------------------------------------------------- verify
+with tab_verify:
+    st.header("Verify a claim")
+    st.caption("Enter text, upload an image, or both. Multiple AI algorithms vote; a stacking ensemble decides.")
+    for col, (name, text) in zip(st.columns(len(EXAMPLES)), EXAMPLES.items()):
+        col.button(name, on_click=lambda t=text: st.session_state.update(claim_text=t), key=f"ex_{name}")
+    c1, c2 = st.columns([1.4, 1])
+    claim = c1.text_area("Claim / post text", key="claim_text", height=150,
+                         placeholder="e.g. Photographs show baby copperhead snakes in a potted plant.")
+    upload = c2.file_uploader("Image (optional)", type=["png", "jpg", "jpeg", "webp"])
+    image = None
+    if upload is not None:
+        from traceverify.images import open_image
+        image = open_image(upload)
+        if image is None:
+            c2.error("Could not read that image.")
+        else:
+            c2.image(image, width=260)
+    if st.button("Verify", type="primary"):
+        if not (claim or "").strip() and image is None:
+            st.warning("Enter a claim, upload an image, or both.")
+        else:
+            with st.spinner("Retrieving evidence and running models..."):
+                st.session_state["result"] = system.verify(claim, image=image, top_k=top_k,
+                                                           use_llm=use_llm, api_key=api_key)
+    if st.session_state.get("result"):
+        st.divider()
+        render_result(st.session_state["result"])
+
+# ----------------------------------------------------------------------------- performance
+with tab_perf:
+    st.header("Models & performance (MOCHEG test split)")
+    classical_r, ens_r = reports.get("classical", {}), reports.get("ensemble", {})
+    deep_r, ret_r = reports.get("deep", {}), reports.get("retrieval", {})
+    rows, cms = [], {}
+    for name, r in classical_r.items():
+        rows.append({"Algorithm": NAMES.get(name, name), "Family": "Classical ML",
+                     "Accuracy": r["test"]["accuracy"], "Macro-F1": r["test"]["macro_f1"]})
+        cms[NAMES.get(name, name)] = r["test"]
+    if ens_r:
+        d = ens_r["member_test"].get("deep_multimodal")
+        if d:
+            rows.append({"Algorithm": NAMES["deep_multimodal"], "Family": "Deep learning",
+                         "Accuracy": d["accuracy"], "Macro-F1": d["macro_f1"]})
+            cms[NAMES["deep_multimodal"]] = d
+        rows.append({"Algorithm": NAMES["stacking_ensemble"], "Family": "Ensemble",
+                     "Accuracy": ens_r["ensemble_test"]["accuracy"], "Macro-F1": ens_r["ensemble_test"]["macro_f1"]})
+        cms[NAMES["stacking_ensemble"]] = ens_r["ensemble_test"]
+    if rows:
+        df = pd.DataFrame(rows)
+        st.dataframe(df.style.format({"Accuracy": "{:.1%}", "Macro-F1": "{:.1%}"}), hide_index=True, width="stretch")
+        pick = st.selectbox("Confusion matrix", list(cms))
+        fig = confusion_fig(cms[pick])
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.info("No reports yet. Run the training scripts (see README).")
+    if ret_r:
+        st.subheader("Evidence retrieval — Recall@k")
+        st.dataframe(pd.DataFrame({"Dense (FAISS)": ret_r["dense"], "Hybrid (dense + BM25)": ret_r["hybrid"]})
+                     .style.format("{:.1%}"), width="stretch")
+    if deep_r.get("modality"):
+        st.subheader("Does the image help?")
+        m = [{"Setting": k.replace("_", " "), "Accuracy": v["accuracy"], "Macro-F1": v["macro_f1"], "n": v["n"]}
+             for k, v in deep_r["modality"].items() if isinstance(v, dict) and "accuracy" in v]
+        st.dataframe(pd.DataFrame(m).style.format({"Accuracy": "{:.1%}", "Macro-F1": "{:.1%}"}),
+                     hide_index=True, width="stretch")
+    if deep_r.get("evidence_settings"):
+        st.subheader("Deep model by evidence source")
+        m = [{"Evidence": k.replace("_", " "), "Accuracy": v["accuracy"], "Macro-F1": v["macro_f1"]}
+             for k, v in deep_r["evidence_settings"].items()]
+        st.dataframe(pd.DataFrame(m).style.format({"Accuracy": "{:.1%}", "Macro-F1": "{:.1%}"}),
+                     hide_index=True, width="stretch")
+        st.caption("'gold' = annotated evidence (oracle). 'retrieved' = RAG evidence with the claim's own "
+                   "fact-check removed, i.e. the realistic setting for a brand-new claim.")
+
+# ----------------------------------------------------------------------------- xai
+with tab_xai:
+    st.header("Explainable AI")
+    st.markdown("""
+| Method | Model explained | Question it answers |
+|---|---|---|
+| **SHAP** (linear) | Logistic Regression | Which words pushed the prediction toward / away from a label? |
+| **Occlusion** | Deep multimodal network | How much does P(label) drop when each word is removed? |
+| **Modality ablation** | Deep multimodal network | How much do the image and the text each contribute? |
+| **CLIP consistency** | Image ↔ claim | Does the picture even match what the post says? |
+| **Retrieved evidence + LLM** | Whole pipeline | What verifiable passages back (or contradict) the verdict? |
+""")
+    st.caption("Attributions describe model behaviour, not truth. That is why they are paired with retrieved evidence.")
+    g = reports.get("shap_global")
+    if g:
+        cls = st.selectbox("Global word importance (mean |SHAP|) for class", list(g),
+                           format_func=lambda c: config.DISPLAY[c], index=min(1, len(g) - 1))
+        s = pd.Series({t: v for t, v in g[cls]}, name="mean |SHAP|")
+        st.bar_chart(s)
+
+# ----------------------------------------------------------------------------- about
+with tab_about:
+    st.header("About")
+    st.markdown("""
+**Pipeline** — input (text / image / both) → **evidence retrieval** (MiniLM + FAISS, BM25, hybrid) →
+**classifiers** (Logistic Regression, Linear SVM, Naive Bayes, Random Forest, deep multimodal network) →
+**stacking ensemble** → **XAI** (SHAP, occlusion, ablation, CLIP) → **RAG explanation** (LLM limited to retrieved evidence).
+
+**Limitations** — this is a research prototype trained on MOCHEG (fact-checked claims, mostly US politics and
+viral rumours). Its evidence corpus is limited to MOCHEG; claims outside it will retrieve weakly related passages
+(the app warns when similarity is low). Verdicts are statistical predictions, **not** verified facts, and image
+analysis is a coarse CLIP signal. Do not use it as the sole basis for any decision.
+""")
