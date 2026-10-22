@@ -65,10 +65,9 @@ uses MOCHEG's large sentence-level corpus (from its `supplementary/` folder) ins
 are each claim's *image evidence* (pictures from the fact-check article); a photo a user uploads may look
 different, so treat the image signal as supporting, not decisive.
 
-### Figures for the paper / viva (one clear PNG per output)
-```bash
-python -m scripts.check_data       # leakage + split report (reports/data_checks.json)
-python -m scripts.make_figures     # -> artifacts/figures/*.png + INDEX.md with suggested captions
+## Generated figures
+
+Running `make_figures.py` produces one PNG per output (architecture, dataset overview, model comparison, confusion matrix, SHAP importance, retrieval recall, modality contribution and example explanations) in `docs/figures/`.
 ```
 Produces: architecture diagram, dataset overview, model comparison, per-class F1, confusion matrices (all + best),
 ROC curves, confidence distribution, top errors (+ CSV of misclassified claims), global SHAP, retrieval Recall@k,
@@ -104,19 +103,16 @@ Then set `TV_ARTIFACT_REPO`, `HF_TOKEN` (if private) and `GROQ_API_KEY` as secre
 * **Streamlit Community Cloud** — works for a text-only build; the torch + CLIP + FAISS stack can exceed its
   memory limit, so prefer Spaces for the full multimodal app.
 
-## What was fixed from the original notebook
-1. **API key exposure** → removed; env/secrets only.
-2. **Recall@k = 0.000 bug** → `claim_id` was `int64` in the test split but `str` in the evidence corpus. IDs are
-   now always strings, and recall is computed in batch over the *entire* test set (not a 200-claim sample).
-   **Dataset** → now the authors' original release with its official splits and real images (the earlier
-   notebook used a Hugging Face copy without usable image file names and a random re-split).
-3. **Label leakage** → `ruling_outline`/`origin` (contain the fact-checker's verdict) are never used.
-4. **Blank LLM output** → reasoning models spend tokens thinking; token budget raised, safe fallback added.
-5. **Honest retrieval/RAG evaluation** → the claim's own fact-check is in the corpus, so Recall@k alone is
-   optimistic. `evaluate.py` also reports a *leave-own-evidence-out* setting that simulates a new claim, and the
-   deep model is trained on that setting by default (`--evidence retrieved`).
-6. **SHAP** → closed-form linear SHAP (identical to `shap.LinearExplainer`; unit-tested against it).
-7. Twitter dataset removed everywhere — MOCHEG only. Cross-split duplicate claims are dropped from val/test.
+## Design decisions and safeguards
+
+1. **Secure key handling.** The Groq API key is read only from environment variables or Streamlit/Colab secrets. It is never stored in code or committed to the repository.
+2. **Consistent claim IDs.** Claim IDs are normalised to strings across the splits and the evidence corpus, and Recall@k is computed in batch over the entire test set rather than a sample.
+3. **Original dataset with official splits.** The system uses the authors' original MOCHEG release with its official train/validation/test splits and real evidence images. Cross-split duplicate claims are removed from validation and test.
+4. **No label leakage.** `ruling_outline` and `origin` contain the fact-checker's verdict, so they are never used as features.
+5. **Reliable LLM explanations.** Reasoning models spend tokens on thinking, so the token budget is raised and a safe fallback explanation is used if the model returns nothing.
+6. **Honest retrieval and RAG evaluation.** A claim's own fact-check is part of the corpus, so Recall@k alone is optimistic. `evaluate.py` also reports a leave-own-evidence-out setting that simulates a new, unseen claim, and the deep model is trained on that setting by default (`--evidence retrieved`).
+7. **Exact, tested SHAP.** Closed-form linear SHAP, identical to `shap.LinearExplainer` and unit-tested against it.
+8. **Single, focused dataset.** MOCHEG only (PolitiFact and Snopes claims with image evidence).
 
 ## Project layout
 ```
