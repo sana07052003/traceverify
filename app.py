@@ -1,7 +1,22 @@
 """TraceVerify - Streamlit app: explainable multimodal misinformation verification (MOCHEG)."""
 from __future__ import annotations
 
-import os
+import os, zipfile
+from pathlib import Path
+import gdown
+
+ART_DIR = Path("/mount/src/traceverify/artifacts")
+
+def ensure_artifacts():
+    if ART_DIR.exists() and any(ART_DIR.iterdir()):
+        return
+    zip_path = "/tmp/artifacts.zip"
+    gdown.download(id="17RdZbvt_61MukuPatMGyAx7nosBEkid6", output=zip_path, quiet=False)
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(ART_DIR.parent)
+    os.remove(zip_path)
+
+ensure_artifacts()
 
 import matplotlib.pyplot as plt
 import pandas as pd
